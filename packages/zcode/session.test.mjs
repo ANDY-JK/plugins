@@ -23,7 +23,13 @@ const start = { type: "oauth", access: jwt, refresh: JSON.stringify({ site: "zai
 const sent = []
 const real = globalThis.fetch
 beforeEach(() => {
+  // bun runs the files of one `bun test` in one process, so the module's
+  // maps are shared: a hold a sibling file left (its jwt is this file's
+  // when both loaded in the same second) would answer the Start Plan
+  // request here locally, without sending it
   _internal.routes.clear()
+  _internal.blocked.clear()
+  _internal.sidelined.clear()
   sent.length = 0
   globalThis.fetch = async (input, init = {}) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
