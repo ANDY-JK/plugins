@@ -195,7 +195,9 @@ test("free first changes nothing for a gift-only account", async () => {
   const opts = await freePlugin({ freeFirst: true }).then((h) => h.loader(async () => giftOnly, { id: "zcode" }))
   const res = await opts.fetch(MSG, { method: "POST", headers: { "content-type": "application/json" }, body: body("GLM-5.3-Flash") })
   expect(res.status).toBe(200)
-  expect(sent.filter((c) => c.path.endsWith("/billing/balance"))).toHaveLength(0)
+  // the account reads its gift's balance to judge the model, and the plain
+  // model still goes to the gift (it already did without the option)
+  expect(sent.filter((c) => c.path.endsWith("/billing/balance"))).toHaveLength(1)
   const m = sent.at(-1)
   expect(m.origin).toBe("https://zcode.z.ai")
   expect(JSON.parse(m.body).model).toBe("GLM-5.3-Flash")
@@ -237,12 +239,13 @@ test("after the minute's rest the plan keeps serving, inside the route's ten", a
   const opts = await freePlugin({ freeFirst: true }).then((h) => h.loader(async () => coding, { id: "zcode" }))
   const first = await opts.fetch(MSG, { method: "POST", headers: { "content-type": "application/json" }, body: body("GLM-5.3-Flash") })
   expect(first.status).toBe(200)
-  // the minute out, the balance still read live: the gift is tried once
-  // more and answered from the plan again, never a 429 of its own
+  // the spent answer takes the model out of the route's gift and holds the
+  // read: the minute's rest is over, but the gift is not asked again until
+  // the balance says the bucket is back (SPENT_HOLD), and the plan serves
   _internal.blocked.set(KEY + "\0" + jwt + "\0glm-5.3-flash", Date.now() - 1)
   const second = await opts.fetch(MSG, { method: "POST", headers: { "content-type": "application/json" }, body: body("GLM-5.3-Flash") })
   expect(second.status).toBe(200)
-  expect(sent.filter((c) => c.origin === "https://zcode.z.ai" && c.path.endsWith("/messages"))).toHaveLength(2)
+  expect(sent.filter((c) => c.origin === "https://zcode.z.ai" && c.path.endsWith("/messages"))).toHaveLength(1)
   expect(sent.filter((c) => c.origin === "https://api.z.ai" && c.path.endsWith("/messages"))).toHaveLength(2)
 })
 
@@ -822,14 +825,15 @@ test("every live plan spends first by its buckets' models, and the card shows th
   expect(u.windows.at(-1).aside).toBe(true) // a spent sibling cannot cap a live bucket
 })
 
-test("a gift-only account sends every request to the gift, and reads no balance to do it", async () => {
+test("a gift-only account sends every request to the gift, and reads its balance once", async () => {
   answers["/api/v1/zcode-plan/anthropic/v1/messages"] = ok({ type: "message", content: [] })
   const only = { type: "oauth", access: jwt, refresh: JSON.stringify({ site: "zai", base: "https://api.z.ai/api/anthropic", jwt, device: DEVICE }), expires: 0 }
   const opts = await (await hooks()).loader(async () => only, { id: "zcode" })
   const res = await opts.fetch(MSG, { method: "POST", headers: { "content-type": "application/json" }, body: body("glm-5.3-flash") })
   expect(res.status).toBe(200)
   expect(sent.at(-1).origin).toBe("https://zcode.z.ai")
-  expect(sent.filter((c) => c.path === "/api/v1/zcode-plan/billing/balance").length).toBe(0)
+  // the balance is read once, for the route the requests behind it share
+  expect(sent.filter((c) => c.path === "/api/v1/zcode-plan/billing/balance").length).toBe(1)
 })
 
 // #369: a GLM Coding Plan account whose plan list read no plan once was sent

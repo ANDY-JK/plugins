@@ -134,12 +134,16 @@ coding plan; when the gift answers a trial entry with a quota error
 (code 1113 "Insufficient balance or no resource package", code 1005
 "exceed quota limit", which it can answer inside an HTTP 200) that too
 becomes a 429 and keeps the entry off for a minute. Any other gift
-answer (its 405, its 401, its 5xx) goes on as it came: the user picked
-the gift, so the coding plan is not spent behind their back. Every other
-429 counts as spent — Z.ai's 1302/1303 rate limits among them — while the
-plan's own in-flight cap (3008/3009) does not: such a request is asked
-again instead (see [A few at once](#a-few-at-once)). A stream's body is
-never read or buffered on the way.
+answer (its 405, its 401, its 5xx, Z.ai's 1302/1303 rate limits) goes on
+as it came: the user picked the gift, so the coding plan is not spent
+behind their back. A refusal of any kind rests the entry a minute, so a
+rate limit is not knocked twice; only the gift's own quota answers
+(1113/1005) count as spent, and they hold the route's balance read off
+the bucket for ten minutes, so no request behind them asks a bucket
+that has nothing left — the plan's own in-flight cap (3008/3009) is
+neither: such a request is asked again instead (see
+[A few at once](#a-few-at-once)). A stream's body is never read or
+buffered on the way.
 
 **Free first.** Picking `-Trial` by hand keeps the choice the user's,
 but an agent that always asks the plain model never sees the gift.
@@ -175,9 +179,12 @@ that runs out between that read and the send has its refusal answered
 from the plan in the same request — any gift failure is, its own
 waited-out busy cap included, and the replay waits out the plan's busy
 cap as any plan request does — and a spent answer or a block page rests
-the model a minute and drops the route's balance read, so the requests
-behind it go straight to the plan. Only a spent answer holds the
-model's `-Trial` entry too; a refusal for another reason (a 405/3012)
+the model a minute, so the requests behind it go straight to the plan.
+A spent answer also holds the route's balance read for ten minutes and
+takes the model off the route's gift, so the requests behind it never
+knock on the bucket again until the read comes back and says it is
+live; a bucket that came back (a grant renewed, a plan reset) is asked
+again then. A refusal for another reason (a 405/3012, a rate limit)
 keeps free first off the gift for the minute but leaves the `-Trial`
 entry asking ZCode, which answers it as it came. Before 0.1.49 the two
 rests were one, and a refused free-first request made the next `-Trial`
@@ -188,6 +195,22 @@ stays an abort. The agent sees the plan's answer
 either way. And the `-Trial` entries keep their own strict semantics —
 asking one is still an explicit pick of the gift alone, never the plan;
 a spent one answers 429 with freeFirst on, as it does without it.
+
+**A gift-only account.** An account with no GLM Coding Plan has the gift
+alone, so its plain models go to the gift and its balance is read once
+per route (ten minutes, a failed read a minute) rather than per request.
+A model the read says has no live bucket, or one whose last request was
+refused, is answered locally until the route's read comes back — the
+spent words magpie reads last (`ZCode's limited quota for <model> is
+exhausted or temporarily unavailable`, which the gateway reads as
+`zcodeTrialRefused` and rests the model, not the account). A spent
+answer holds the read for ten minutes; any other refusal, a minute. That
+minute's rest holds the read too, for this account alone: a rate limit
+says nothing about whether the bucket came back, and a read is its only
+way to find out, so the requests behind the rest are answered locally
+from the one read rather than reading the balance per request. A dual
+account still drops its read on another refusal, since the plan behind
+it is what the next request asks.
 
 ## A few at once
 

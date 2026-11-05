@@ -234,8 +234,25 @@ async function startPlan(jwt, device, coming = false) {
 const routes = new Map()
 async function plansOf(s) {
   if (!s.jwt) return { start: false, gift: null }
-  if (!s.key && !isTeam(s)) return { start: true, gift: null }
   const id = s.key + "\0" + s.jwt
+  if (!s.key && !isTeam(s)) {
+    // a gift-only account (no coding plan) is judged by its balance alone,
+    // so its route reads it: the same ten minutes a dual account's read is
+    // kept for. Before, this account read the balance on every request,
+    // and a bucket that had spent what it had was asked again each time.
+    const r = routes.get(id)
+    if (r && Date.now() - r.at < r.ttl) return r
+    let gift = null
+    let failed = false
+    try {
+      gift = await startPlan(s.jwt, s.device).catch(() => ((failed = !jwtExpired(s.jwt)), null))
+    } catch {
+      failed = true
+    }
+    const out = { start: true, gift, at: Date.now(), ttl: failed ? 60_000 : Math.min(600_000, gift?.ttl ?? 600_000) }
+    routes.set(id, out)
+    return out
+  }
   const r = routes.get(id)
   if (r && Date.now() - r.at < r.ttl) return r
   let start = false
@@ -275,6 +292,9 @@ async function plansOf(s) {
 
 // blocked remembers the models a gift said it has none left for: a key+jwt+
 // model for a minute, so one turn that is refused does not ask again.
+// The longer SPENT_HOLD holds the whole route's balance read, so a model a
+// gift said it spent nothing left of is not asked again until the read says
+// its bucket has come back.
 const blocked = new Map()
 // sidelined remembers, the same way, the models whose gift turned free
 // first away for another reason (a 405/3012, a block page): free first
@@ -288,22 +308,50 @@ const rest = (map, k) => {
   map.set(k, Date.now() + 60_000)
 }
 
+// SPENT_HOLD is how long the route's balance read is kept after the gift
+// said a bucket has none left: the requests go to the plan for that while
+// instead of asking the spent bucket again, and instead of re-reading the
+// balance for every one of them. A bucket renews (its balance says when, or
+// its plan's window) sooner than this is read again then.
+const SPENT_HOLD = 10 * 60_000
+
 // giftServes: the gift's buckets name their models lowercased ("glm-5.3-
 // flash"); what is asked for arrives as the plan lists it ("GLM-5.3-Flash").
 const giftServes = (gift, m) => (gift.models ?? []).some((x) => x.toLowerCase() === m.toLowerCase())
-const giftRested = (s, m) => Date.now() < (blocked.get(s.key + "\0" + s.jwt + "\0" + m.toLowerCase()) ?? 0)
+// restOf is where a model's refusal is remembered: the bucket's own name, as
+// the balance read spelled it, so a request later finds it (a request asks
+// for the model's own name, and a -Trial entry names its bucket).
+const restOf = (gift, m) => giftNames(gift).find((x) => x.toLowerCase() === m.toLowerCase()) ?? m
+// restOfSpent reads the name a spent answer is held under: the route's gift,
+// as it stands after the answer (the spent bucket is no longer live)
+const restOfSpent = (s, m) => restOf(routes.get(s.key + "\0" + s.jwt)?.gift ?? null, m)
+const restKey = (s, gift, m) => s.key + "\0" + s.jwt + "\0" + restOf(gift, m).toLowerCase()
+const giftRested = (s, gift, m) => Date.now() < (blocked.get(restKey(s, gift, m)) ?? 0)
 const giftUsable = (s, gift, m) => !jwtExpired(s.jwt) && giftServes(gift, m) &&
-  Date.now() >= (blocked.get(s.key + "\0" + s.jwt + "\0" + m.toLowerCase()) ?? 0)
-const giftSidelined = (s, m) => Date.now() < (sidelined.get(s.key + "\0" + s.jwt + "\0" + m.toLowerCase()) ?? 0)
+  Date.now() >= (blocked.get(restKey(s, gift, m)) ?? 0)
+const giftSidelined = (s, gift, m) => Date.now() < (sidelined.get(restKey(s, gift, m)) ?? 0)
+// giftLive answers for the requests, from the route's balance alone: true
+// when a bucket serving m is live, or when the read named none for it (the
+// balance's word, kept as it came — the requests are then judged by the
+// gift's own answers and the card, not by a read this process never made).
+// Only a read that named the model and no live bucket for it says spent, so
+// a bucket a rate limit turned away is still asked once the minute's rest
+// is out: a rate limit comes back, a bucket that ran out does not until its
+// window renews.
+const giftLive = (gift, m) => {
+  const all = gift?.allModels ?? []
+  if (!all.some((x) => x.toLowerCase() === m.toLowerCase())) return true
+  return (gift?.models ?? []).some((x) => x.toLowerCase() === m.toLowerCase())
+}
 
 // spentUp is the gift saying it has nothing left to spend: its own no-
 // resource-package code 1113, its "exceed quota limit" 1005 — a spent gift
-// can answer a 200 with a JSON body carrying one of those codes. Every other
-// 429 counts as spent, Z.ai's 1302/1303 rate limits among them; the plan's
-// own in-flight cap (3008/3009) does not, since it is a turn not yet come.
+// can answer a 200 with a JSON body carrying one of those codes. Z.ai's
+// rate limits (1302/1303, any other 429 without a quota code) are not
+// spent, and the plan's own in-flight cap (3008/3009) is not either, since
+// it is a turn not yet come.
 function spentUp(text, status) {
   if (busy(status, text)) return false
-  if (status === 429) return true
   let b
   try { b = JSON.parse(text) } catch { return false }
   if (!b || typeof b !== "object") return false
@@ -311,6 +359,25 @@ function spentUp(text, status) {
   const c1 = code(b.code), c2 = code(b.error?.code)
   return c1 === "1113" || c1 === "1005" || c2 === "1113" || c2 === "1005"
 }
+
+// SPENT_WORDS are what magpie's zcodeSpentWords reads at the end of a local
+// 429's message: this account's limited quota for a model is exhausted. The
+// plugin's local answers keep those words last (the gateway's read is
+// zcode_trial.go), or magpie would rest the whole account rather than the
+// model. The model is named as ZCode's balance spells it (wireModel), since
+// that is the name a request asked for and the one the model list shows.
+const SPENT_WORDS = (m) => `ZCode's limited quota for ${m} is exhausted or temporarily unavailable`
+// spentLocal is a spent answer the plugin makes itself (from its balance
+// read) rather than one ZCode sent: the agent's answer, and the words magpie
+// reads last.
+const spentLocal = (m) => kept(new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: SPENT_WORDS(m) } }), { status: 429, headers: { "content-type": "application/json" } }))
+
+// spentUp's words are the gift's own; every other refusal (a rate limit, a
+// block page, a 4xx, a 5xx) rests the model a minute too, since a request
+// refused is not asked again while the agent is still sending. Only a spent
+// answer holds the route's balance read off its bucket for SPENT_HOLD: a
+// rate limit comes back, a bucket that ran out does not until its window.
+const giftRefused = (res, text) => res.status >= 400 && !busy(res.status, text)
 
 // ---- keys ------------------------------------------------------------------------
 
@@ -2462,9 +2529,55 @@ export async function ZCodeAuthPlugin({ client, magpie } = {}, options = {}) {
             // says it is spent can spend nothing and replay what was asked for
             let start = alone
             let orig, forcedGift = false, freeGift = false
+            // asked is the model as the agent sent it, and spentAs is the
+            // bucket's own name for it (a -Trial entry's without the suffix):
+            // the rest is keyed by that name, so a request later reads the
+            // same key
             let asked = ""
+            let spentAs = ""
             let renamed = false
             const done = (res) => (renamed ? searchNamed(res) : res)
+            const routeID = () => s.key + "\0" + s.jwt
+            // holdRoute keeps the route's balance read after the gift said a
+            // bucket has none left, so the requests behind it are not sent to
+            // that bucket again and no balance is read per request. SPENT_HOLD
+            // counts from the read that found the bucket spent, so a read
+            // made for another reason (the card) does not hold it off the
+            // whole ten minutes from now.
+            const holdRoute = () => {
+              const r = routes.get(routeID())
+              if (r) r.at = Date.now() - r.ttl + SPENT_HOLD
+            }
+            // restModel is a gift answer this account must not ask again yet:
+            // the model rests a minute and, when the gift said it is spent,
+            // the route's balance read is held too, so the requests behind it
+            // go straight to the plan without a read per request — and, a
+            // gift-only account, without asking the spent bucket again. A
+            // quota answer rests it in blocked, which a -Trial entry obeys
+            // too; any other refusal (spent false) in sidelined, which only
+            // free first reads.
+            const restModel = (spent) => {
+              // the bucket's own name, as the read spelled it: a -Trial
+              // request's later rest is read under the same name
+              rest(spent ? blocked : sidelined, restKey(s, gift, spentAs))
+              if (spent) {
+                // the spent bucket leaves the route's live models, so the
+                // gift itself stops naming it too
+                const r = routes.get(routeID())
+                if (r?.gift) {
+                  const live = (r.gift.models ?? []).filter((x) => x.toLowerCase() !== spentAs.toLowerCase())
+                  r.gift = { ...r.gift, models: live }
+                }
+                holdRoute()
+              } else if (!alone) routes.delete(routeID())
+              // a gift-only account's other refusals keep its read too: a
+              // rate limit says the bucket came back or not, not that the
+              // account has none left, and a read is its only way to find
+              // out. Dropping it read the balance on every request behind
+              // it (magpie sends every session's through this one process),
+              // which is a knock per request on a gift the user is trying to
+              // make last.
+            }
             if (opts.body != null) {
               orig = opts.body = typeof opts.body === "string" ? opts.body : await new Response(opts.body).text()
               delete opts.duplex
@@ -2477,18 +2590,55 @@ export async function ZCodeAuthPlugin({ client, magpie } = {}, options = {}) {
               }
               let m = modelOf(orig)
               asked = m
+              spentAs = m.toLowerCase().endsWith("-trial") ? m.slice(0, -"-trial".length) : m
+              // a gift-only account (no coding plan behind it) is judged by
+              // its balance alone: a model no live bucket serves is answered
+              // locally, not sent to a bucket the read has spent or never
+              // named. plansOf has just read that balance (a null gift is a
+              // read that failed, unknown rather than spent), so no request
+              // reads it again. A dual account keeps the plan behind it, so
+              // only free first's pick (below) reads the gift's live buckets.
+              if (alone && m && !m.toLowerCase().endsWith("-trial")) {
+                if (gift && !giftLive(gift, m)) {
+                  // the hold is this account's read: the next request asks
+                  // no balance, only the bucket it is held off. SPENT_HOLD
+                  // counts from the read that found the bucket spent, so a
+                  // balance read that happened to be made for another
+                  // reason (the card) does not hold it off the whole ten
+                  // minutes from now.
+                  holdRoute()
+                  return spentLocal(wireModel(m))
+                }
+                // a bucket that turned this model away a moment ago (a rate
+                // limit, a 5xx) is not knocked again for the minute; a spent
+                // answer is held under the bucket's name, as the route's
+                // gift stands after it (the bucket no longer live)
+                const rested = giftRested(s, gift, m)
+                if (rested) {
+                  const error = { type: "rate_limit_error", message: `ZCode said the last request for ${restOf(gift, m)} was over its limit, so it is not asked again for a minute` }
+                  return kept(new Response(JSON.stringify({ type: "error", error }), { status: 429, headers: { "content-type": "application/json" } }))
+                }
+                const held = Date.now() < (blocked.get(restKey(s, routes.get(s.key + "\0" + s.jwt)?.gift ?? null, m)) ?? 0)
+                if (held) {
+                  const error = { type: "rate_limit_error", message: `ZCode said the last request for ${restOfSpent(s, m)} was over its quota, so it is not asked again until its balance is read again` }
+                  return kept(new Response(JSON.stringify({ type: "error", error }), { status: 429, headers: { "content-type": "application/json" } }))
+                }
+              }
               if (m.toLowerCase().endsWith("-trial")) {
                 gift ??= await startPlan(s.jwt, s.device).catch(() => null)
                 const raw = giftModel(gift, m)
                 const available = raw && giftUsable(s, gift, raw)
                 if (!available) {
-                  const error = { type: raw ? "rate_limit_error" : "invalid_request_error", message: raw ? `${giftRested(s, raw) ? `ZCode said the last request for ${raw} was over its quota, so it is not asked again for a minute: ` : ""}ZCode's limited quota for ${raw} is exhausted or temporarily unavailable` : `ZCode has no active limited quota for ${m}` }
-                  return kept(new Response(JSON.stringify({ type: "error", error }), { status: raw ? 429 : 400, headers: { "content-type": "application/json" } }))
+                  if (!raw) return kept(new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `ZCode has no active limited quota for ${m}` } }), { status: 400, headers: { "content-type": "application/json" } }))
+                  const message = giftRested(s, gift, raw)
+                    ? `ZCode said the last request for ${raw} was over its quota, so it is not asked again for a minute: ${SPENT_WORDS(raw)}`
+                    : SPENT_WORDS(raw)
+                  return kept(new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message } }), { status: 429, headers: { "content-type": "application/json" } }))
                 }
                 orig = opts.body = JSON.stringify({ ...JSON.parse(orig), model: wireModel(raw) })
                 m = raw
                 forcedGift = true
-              } else if (!alone && !edgeHeld() && freeFirst(provider?.options) && s.jwt && known && giftUsable(s, known, m) && !giftSidelined(s, m)) {
+              } else if (!alone && !edgeHeld() && freeFirst(provider?.options) && s.jwt && known && giftUsable(s, known, m) && !giftSidelined(s, known, m)) {
                 // free first: the plain model spends the account's own live
                 // gift before it spends the coding plan, under the name the
                 // gift lists. The gift is the route's cache alone (a failed
@@ -2497,7 +2647,7 @@ export async function ZCodeAuthPlugin({ client, magpie } = {}, options = {}) {
                 // gift-only account is already on the gift and is left as
                 // it was. A refusal past this check is replayed on the plan
                 // in the same request (replayOnPlan below).
-                const raw = giftNames(known).find((x) => x.toLowerCase() === m.toLowerCase())
+                const raw = giftNames(known).find((x) => x.toLowerCase() === m.toLowerCase()) || m
                 orig = opts.body = JSON.stringify({ ...JSON.parse(orig), model: wireModel(raw) })
                 m = raw
                 freeGift = true
@@ -2516,16 +2666,6 @@ export async function ZCodeAuthPlugin({ client, magpie } = {}, options = {}) {
             const askedUrl = url
             const place = workPlace(h)
             const sid = sessionOf(h.get("x-session-id"), s.device)
-            // restModel is free first's gift turning this model away: the
-            // model rests a minute and the route is dropped, so the requests
-            // behind it re-read the balance and go straight to the plan. A
-            // quota answer rests it in blocked, which a -Trial entry obeys
-            // too; any other refusal (spent false) in sidelined, which only
-            // free first reads.
-            const restModel = (spent) => {
-              rest(spent ? blocked : sidelined, s.key + "\0" + s.jwt + "\0" + asked.toLowerCase())
-              routes.delete(s.key + "\0" + s.jwt)
-            }
             // replayOnPlan is free first's answer to a gift that refused
             // what its own balance read had promised: the model as the
             // agent sent it, the plan's headers, the plan's own patience
@@ -2633,17 +2773,42 @@ export async function ZCodeAuthPlugin({ client, magpie } = {}, options = {}) {
             // a trial entry's gift answer that can't serve the request is
             // the agent's answer, not the coding plan's: the user picked the
             // gift, so a spent bucket says 429 (its quota error inside a 200
-            // among them) and anything else goes on as it came. A quota
-            // answer keeps that model off the gift for a minute, so a rate
-            // limit is not knocked twice. A stream's body is never read here.
+            // among them) and anything else goes on as it came. A refusal
+            // keeps that model off the gift for a minute, so a rate limit is
+            // not knocked twice, and a spent one holds the route's read off
+            // its bucket too, so no request behind it asks the bucket again
+            // until the balance read comes back. A stream's body is never
+            // read here.
             if (start && forcedGift) {
               const json = (res.headers.get("content-type") ?? "").includes("application/json")
               if (res.status >= 400 || json) {
                 const text = await res.text()
                 const spent = spentUp(text, res.status)
                 if (!spent && res.status < 400) return done(kept(res, text))
-                if (spent) rest(blocked, s.key + "\0" + s.jwt + "\0" + modelOf(orig).toLowerCase())
+                if (spent) restModel(true)
+                else if (giftRefused(res, text)) rest(blocked, restKey(s, gift, spentAs))
                 return spent && res.status < 400 ? kept(new Response(text, { status: 429, headers: res.headers })) : done(kept(res, text))
+              }
+            }
+            // a gift-only account's plain model answered by the gift itself:
+            // there is no plan behind it to replay on, so the answer is the
+            // gift's — a spent bucket's 429 (its quota error inside a 200
+            // among them) is re-said with the words magpie reads, and any
+            // other refusal goes on as it came. A spent one is answered
+            // locally from here on until the route's held read comes back,
+            // and any refusal keeps the model off the gift a minute. A
+            // stream's body is never read here.
+            else if (start && alone && !freeGift) {
+              const json = (res.headers.get("content-type") ?? "").includes("application/json")
+              if (res.status >= 400 || json) {
+                const text = await res.text()
+                const spent = spentUp(text, res.status)
+                if (spent) {
+                  restModel(true)
+                  return spentLocal(asked)
+                }
+                if (giftRefused(res, text)) rest(blocked, restKey(s, gift, spentAs))
+                return done(kept(new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers })))
               }
             }
             // free first's gift answer: the choice was the plugin's, so the
@@ -2666,7 +2831,7 @@ export async function ZCodeAuthPlugin({ client, magpie } = {}, options = {}) {
                   return done(kept(await replayOnPlan()))
                 }
                 if (res.status >= 400) {
-                  if (!cap && (res.status === 401 || res.status === 403)) routes.delete(s.key + "\0" + s.jwt)
+                  if (!cap && (res.status === 401 || res.status === 403)) routes.delete(routeID())
                   return done(kept(await replayOnPlan()))
                 }
                 return done(kept(res, text))
@@ -2795,4 +2960,4 @@ export async function ZCodeAuthPlugin({ client, magpie } = {}, options = {}) {
 // config sets what zcodeConfig has read, for tests: null is ZCode's config
 // out of reach, undefined forgets it
 const config = (cfg) => (cfgCache = cfg === undefined ? null : { cfg, at: Date.now() })
-export const _internal = { edge, EDGE_HOLD, config, entry, limitWindows, termOf, startUsage, routes, blocked, sidelined, plansOf, giftOf, dualUsage, claimHint, claimDaily, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, located, dress, PROMPT, marked, keyDevice, sessionOf, busy, BUSY_WAITS, DEFAULT_CONCURRENCY, DEFAULT_ACCOUNTS }
+export const _internal = { edge, EDGE_HOLD, config, entry, limitWindows, termOf, startUsage, routes, blocked, sidelined, plansOf, giftOf, dualUsage, claimHint, claimDaily, spentUp, giftServes, giftLive, SPENT_HOLD, SPENT_WORDS, modelOf, teamKeys, ownSignIn, stateOf, located, dress, PROMPT, marked, keyDevice, sessionOf, busy, BUSY_WAITS, DEFAULT_CONCURRENCY, DEFAULT_ACCOUNTS }

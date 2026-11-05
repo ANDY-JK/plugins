@@ -72,7 +72,9 @@ async function send(auth, body, { url = "https://api.z.ai/api/anthropic/v1/messa
     ? await opts.fetch(new Request(url, { method: "POST", headers, body }))
     : await opts.fetch(url, { method: "POST", headers, body })
   expect(res.status).toBe(200)
-  expect(got.length).toBe(requests)
+  // a Start Plan account reads its gift's balance first (a gift-only
+  // account is judged by it), so the balance read is not counted here
+  expect(got.filter((r) => !r.path.endsWith("/billing/balance")).length).toBe(requests)
   const messages = got.filter((r) => r.path.endsWith("/messages"))
   expect(messages.length).toBe(1)
   return messages[0]
@@ -416,7 +418,7 @@ test("a GLM Coding Plan key's request goes as the agent sent it", async () => {
 test("a team seat's request goes as the agent sent it, ZCode's token or not", async () => {
   const s = { site: "zai", base: "https://api.z.ai/api/anthropic", key: "seat.secret", token: "tok", org: "o1", project: "p1", jwt, device: DEVICE }
   const auth = { type: "oauth", access: s.key, refresh: JSON.stringify(s), expires: 0 }
-  sentAsIs(await send(auth, agentText, { requests: 2 }), "seat.secret", "/api.z.ai/api/anthropic/v1/messages", DEVICE)
+  sentAsIs(await send(auth, agentText, { requests: 1 }), "seat.secret", "/api.z.ai/api/anthropic/v1/messages", DEVICE)
   expect(got.filter((r) => r.path.endsWith("/billing/balance"))).toHaveLength(1)
   expect(got.filter((r) => r.path.endsWith("/subscription/list"))).toHaveLength(0)
   got.length = 0

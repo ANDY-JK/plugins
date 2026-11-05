@@ -21,7 +21,12 @@ beforeAll(() => {
   server = Bun.serve({
     port: 0,
     async fetch(req) {
-      got.push({ path: new URL(req.url).pathname, headers: Object.fromEntries(req.headers), body: await req.text() })
+      const path = new URL(req.url).pathname
+      // a Start Plan (gift-only) account reads its gift's balance once per
+      // route: the tests here count the messages, so it is answered and not
+      // recorded (no plan rows: the gift is unknown, as before this read)
+      if (path.endsWith("/billing/balance")) return Response.json({ code: 0, data: { server_time: Math.floor(Date.now() / 1000), plans: [], balances: [] } })
+      got.push({ path, headers: Object.fromEntries(req.headers), body: await req.text() })
       if (answer) return answer()
       return Response.json({ type: "message", content: [] })
     },
@@ -94,10 +99,11 @@ test("the cap's own codes are not a gift spent", () => {
   expect(spentUp(JSON.stringify(CAP), 429)).toBe(false)
   expect(spentUp('{"code":3009,"msg":"model concurrency limit exceeded"}', 429)).toBe(false)
   expect(spentUp('{"error":{"code":"3008","message":"user concurrency limit exceeded"}}', 429)).toBe(false)
-  // a 429 that is a rate limit or a spent plan is as it was
-  expect(spentUp('{"code":1302,"msg":"rate limit reached"}', 429)).toBe(true)
+  // only the gift's own no-resource answer is spent: a rate limit comes
+  // back, so it rests the model a minute and holds no route
+  expect(spentUp('{"code":1302,"msg":"rate limit reached"}', 429)).toBe(false)
+  expect(spentUp("", 429)).toBe(false)
   expect(spentUp('{"error":{"code":"1113"}}', 429)).toBe(true)
-  expect(spentUp("", 429)).toBe(true)
   expect(spentUp('{"code":1005}', 200)).toBe(true)
 })
 

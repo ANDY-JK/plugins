@@ -14,12 +14,13 @@ const MSG = "https://api.z.ai/api/anthropic/v1/messages"
 const ok = (data) => new Response(JSON.stringify({ code: 0, data }), { headers: { "content-type": "application/json" } })
 const real = globalThis.fetch
 const sent = []
-let balance, paid, giftReply
+let balance, paid, giftReply, reads
 
 beforeEach(() => {
   _internal.routes.clear()
   _internal.blocked.clear()
   sent.length = 0
+  reads = 0
   paid = 100
   giftReply = new Response(JSON.stringify({ type: "message", content: [] }), { headers: { "content-type": "application/json" } })
   balance = {
@@ -31,7 +32,7 @@ beforeEach(() => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.pathname === "/api/biz/subscription/list") return ok([{ productName: "GLM Coding Pro", status: "VALID" }])
     if (url.pathname === "/api/monitor/usage/quota/limit") return ok({ limits: [{ type: "CREDIT_LIMIT", unit: 6, number: 1, percentage: paid, nextResetTime: (now + 86400) * 1000 }] })
-    if (url.pathname === "/api/v1/zcode-plan/billing/balance") return ok(balance)
+    if (url.pathname === "/api/v1/zcode-plan/billing/balance") { reads++; return ok(balance) }
     if (url.pathname.endsWith("/messages")) {
       const text = init.body ?? (input instanceof Request ? await input.text() : undefined)
       sent.push({ origin: url.origin, path: url.pathname, body: JSON.parse(text), headers: new Headers(init.headers ?? (input instanceof Request ? input.headers : {})) })
@@ -394,11 +395,121 @@ test("a flash gift goes out under ZCode's registry spelling, as the app sends it
 
 test("a refused-then-rested gift says why it is refused locally", async () => {
   giftReply = new Response(JSON.stringify({ error: { code: "1302", message: "rate limit" } }), { status: 429, headers: { "content-type": "application/json" } })
-  expect((await send()).status).toBe(429)
-  const again = await send()
+  expect((await send(alias)).status).toBe(429)
+  const again = await send(alias)
   expect(again.status).toBe(429)
   expect(sent).toHaveLength(1)
-  expect((await again.json()).error.message).toContain("not asked again for a minute")
+  // the local answer keeps the words magpie reads last (zcode_trial.go's
+  // zcodeSpentWords), or the gateway rests the whole account, not the model
+  const said = (await again.json()).error.message
+  expect(said).toContain("not asked again for a minute")
+  expect(said).toMatch(/(?:^|: )ZCode's limited quota for (\S+) is exhausted or temporarily unavailable$/)
+})
+
+// a gift-only account (no GLM Coding Plan) whose gift has spent what it had
+// is the account the user means by "用完基本就没了就不要再打了": there is no
+// plan behind it, so every request after the balance says spent was a knock
+// on a bucket with nothing in it, once a minute for as long as the agent ran.
+// The balance is read once and held for SPENT_HOLD, and the requests are
+// answered locally until it comes back.
+test("a gift-only account whose gift is spent answers locally and asks no more", async () => {
+  balance.balances[0].capabilities = ["model:GLM-5.3-Flash"]
+  const only = { type: "oauth", access: jwt, refresh: JSON.stringify({ ...state, key: undefined, plan: undefined }), expires: 0 }
+  const sendOnly = (model = "GLM-5.3-Flash") => send(model, only)
+  // the balance read first says the bucket is live, so the first request asks
+  expect((await sendOnly()).status).toBe(200)
+  expect(sent).toHaveLength(1)
+  expect(sent[0].origin).toBe("https://zcode.z.ai")
+  // then the bucket runs out, and the gift says so itself: the model rests a
+  // minute, the route's read is held for SPENT_HOLD, and every request behind
+  // it is answered locally — no read per request, no ask
+  giftReply = new Response(JSON.stringify({ error: { code: "1113", message: "Insufficient balance or no resource package" } }), { status: 429, headers: { "content-type": "application/json" } })
+  expect((await sendOnly()).status).toBe(429)
+  for (let i = 0; i < 3; i++) {
+    const res = await sendOnly()
+    expect(res.status).toBe(429)
+    expect(JSON.parse(await res.text()).error.message).toContain("exhausted or temporarily unavailable")
+  }
+  expect(sent).toHaveLength(2)
+  // the first request's read is the one held; the spent answer and the
+  // local answers behind it read none
+  expect(reads).toBe(1)
+  // the hold is SPENT_HOLD: past it the balance is read again, and a bucket
+  // that came back is asked. The minute's rest from the spent answer is
+  // over by now (the test ran longer than it), so nothing holds the bucket
+  const r = _internal.routes.get("\0" + jwt)
+  expect(r.ttl).toBeLessThanOrEqual(_internal.SPENT_HOLD)
+  r.at -= _internal.SPENT_HOLD + 1
+  _internal.blocked.clear()
+  Object.assign(balance.balances[0], { used_units: 0, remaining_units: 100 })
+  giftReply = new Response(JSON.stringify({ type: "message", content: [] }), { headers: { "content-type": "application/json" } })
+  expect((await sendOnly()).status).toBe(200)
+  expect(reads).toBe(2)
+  // the minute's rest from the spent answer is over by now, so the bucket is
+  // asked again, not held off by it
+  expect((await sendOnly()).status).toBe(200)
+  expect(sent.filter((c) => c.origin === "https://zcode.z.ai")).toHaveLength(4)
+})
+
+
+// a rate limit is not spent: after the minute's rest the same bucket is
+// asked again, since a rate limit comes back while a plan that ran out does
+// not
+test("a rate-limited gift-only account asks again after the minute's rest", async () => {
+  const only = { type: "oauth", access: jwt, refresh: JSON.stringify({ ...state, key: undefined, plan: undefined }), expires: 0 }
+  giftReply = new Response(JSON.stringify({ error: { code: "1302", message: "rate limit" } }), { status: 429, headers: { "content-type": "application/json" } })
+  expect((await send(alias, only)).status).toBe(429)
+  expect((await send(alias, only)).status).toBe(429)
+  expect(sent).toHaveLength(1)
+  // the minute out, the bucket is asked again: not spent, only rate limited
+  _internal.blocked.set("\0" + jwt + "\0" + "glm-limited-preview", Date.now() - 1)
+  giftReply = new Response(JSON.stringify({ type: "message", content: [] }), { headers: { "content-type": "application/json" } })
+  expect((await send(alias, only)).status).toBe(200)
+  expect(sent.filter((c) => c.origin === "https://zcode.z.ai")).toHaveLength(2)
+})
+
+// a gift-only account has no plan behind a plain model either: the gift's
+// own rate limit rests the model a minute, and the requests behind it are
+// answered locally rather than knocking the bucket again
+test("a rate-limited gift-only account's plain model is not knocked twice", async () => {
+  const only = { type: "oauth", access: jwt, refresh: JSON.stringify({ ...state, key: undefined, plan: undefined }), expires: 0 }
+  giftReply = new Response(JSON.stringify({ error: { code: "1302", message: "rate limit" } }), { status: 429, headers: { "content-type": "application/json" } })
+  expect((await send("GLM-5.3-Flash", only)).status).toBe(429)
+  const again = await send("GLM-5.3-Flash", only)
+  expect(again.status).toBe(429)
+  expect(sent).toHaveLength(1)
+  const said = (await again.json()).error.message
+  expect(said).toContain("not asked again for a minute")
+  // not a spent bucket: magpie's spent words stay off it
+  expect(said).not.toContain("exhausted or temporarily unavailable")
+  // the minute out, the bucket is asked again
+  _internal.blocked.set("\0" + jwt + "\0glm-5.3-flash", Date.now() - 1)
+  giftReply = new Response(JSON.stringify({ type: "message", content: [] }), { headers: { "content-type": "application/json" } })
+  expect((await send("GLM-5.3-Flash", only)).status).toBe(200)
+  expect(sent.filter((c) => c.origin === "https://zcode.z.ai")).toHaveLength(2)
+})
+
+// the other refusal of a gift-only account keeps its balance read too: the
+// requests behind a rate limit are answered locally (the rest above), and a
+// read is that account's only way to learn the bucket came back. Dropping it
+// read the balance on every request behind the rest — a knock per request on
+// the gift the user is trying to make last.
+test("a rate-limited gift-only account reads its balance once, not per request", async () => {
+  const only = { type: "oauth", access: jwt, refresh: JSON.stringify({ ...state, key: undefined, plan: undefined }), expires: 0 }
+  giftReply = new Response(JSON.stringify({ error: { code: "1302", message: "rate limit" } }), { status: 429, headers: { "content-type": "application/json" } })
+  expect((await send(alias, only)).status).toBe(429)
+  expect(reads).toBe(1)
+  for (let i = 0; i < 3; i++) expect((await send(alias, only)).status).toBe(429)
+  expect(sent).toHaveLength(1)
+  expect(reads).toBe(1) // the read is held, not repeated
+  // the minute out, the held read is still the route's, so the bucket is
+  // asked from the same read — one more read when it comes back, not one
+  // per request until then
+  _internal.blocked.set("\0" + jwt + "\0" + "glm-limited-preview", Date.now() - 1)
+  giftReply = new Response(JSON.stringify({ type: "message", content: [] }), { headers: { "content-type": "application/json" } })
+  expect((await send(alias, only)).status).toBe(200)
+  expect(sent.filter((c) => c.origin === "https://zcode.z.ai")).toHaveLength(2)
+  expect(reads).toBe(1)
 })
 
 // young02036 (Discord, 11-05): two ZCode accounts, one with no GLM Coding

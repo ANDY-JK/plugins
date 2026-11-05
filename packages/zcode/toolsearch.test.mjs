@@ -111,7 +111,9 @@ test("a GLM Coding Plan request offers Claude Code's search as ToolSearchTool, e
 
 test("a Start Plan request offers it as ToolSearchTool too", async () => {
   const { sent } = await send(startPlan, claudeCode())
-  expect(got[0].path).toBe("/zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages")
+  // a Start Plan account reads its gift's balance first
+  expect(got.filter((r) => r.path.endsWith("/billing/balance"))).toHaveLength(1)
+  expect(got.filter((r) => r.path.endsWith("/messages"))[0].path).toBe("/zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages")
   expectSearchless(sent)
 })
 
